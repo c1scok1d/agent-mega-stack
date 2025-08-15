@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CMD="${1:-help}"
+SHIFTED="${2:-}"
+
+MODEL_PATH="${MODEL_PATH:-/Users/rodneychatman/Desktop/llm-models/llama-2-7b-chat.Q8_0.gguf}"
+LLAMA_PORT="${LLAMA_PORT:-8081}"
+API_PORT="${API_PORT:-8080}"
+
+# --- diagnostics helpers -------------------------------------------------------
+
+function _diag() {
+  echo "----- diagnostics -----"
+  echo "OS: $(uname -a || true)"
+  echo "SHELL: ${SHELL:-}"
+  echo "PWD: $(pwd)"
+  echo "DOCKER_HOST: ${DOCKER_HOST:-<unset>}"
+  echo "Docker contexts:"
+  docker context ls 2>/dev/null || echo "(no docker context available)"
+  echo "Active context: $(docker context show 2>/dev/null || echo '(unknown)')"
+  echo "Docker compose: $(_compose)"
+  echo "Docker info (summary):"
+  docker info 2>/dev/null | sed -n '1,20p' || echo "(docker info unavailable)"
+  echo "-----------------------"
+}
+
+# Detect compose command (docker compose v2 preferred, fallback to docker-compose)
+function _compose() {
+  if docker compose version >/dev/null 2>&1; then
+    echo "docker compose"
+  elif docker-compose version >/dev/null 2>&1; then
+    echo "docker-compose"
+  else
+    echo "ERROR: Docker Compose not found. Install Docker Desktop or 'brew install docker-compose'." >&2
+    exit 1
+  fi
+}
+
+# Ensure Docker daemon is reachable (Colima → Docker Desktop fallback)
+function ensure_docker() {
+  # Need docker CLI at least
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "[-] Missing Docker CLI. Install via: brew install docker docker-compose" >&2
+    return 1
+  fi
+
+  # If it's already working, we're done
+  if docker info >/dev/null 2>&1; then
+    echo "[OK] Docker daemon is reachable."
+    _diag
+    return 0
+  fi
+
+  echo "[!] Docker daemon not reachable."
+
+  # Unset DOCKER_HOST if it points to a dead socket/context
+  if [[ -n "${DOCKER_HOST:-}" ]]; then
+    echo "[*] Unsetting stale DOCKER_HOST (${DOCKER_HOST})"
+    unset DOCKER_HOST
+  fi
+
+  # Try Colima
+  if command -v colima >/dev/null 2>&1; then
+    echo "[*] Attempting to start Colima…"
+    colima start --cpu "${COLIMA_CPU:-4}" --memory "${COLIMA_MEMORY:-8}" --disk "${COLIMA_DISK:-60}" || true
+    docker context use colima >/dev/null 2>&1 || true
+    if docker info >/dev/null 2>&1; then
+      echo "[OK] Docker is up via Colima."
+      _diag
+      return 0
+    fi
+  fi
+
+  # Try Docker Desktop (macOS)
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    if command -v open >/dev/null 2>&1; then
+      echo "[*] Trying Docker Desktop…"
+      open -g -a "Docker.app" || true
+      echo "[*] Waiting up to 60s for Docker Desktop…"
+      for i in {1..30}; do
+        sleep 2
+        if docker info >/dev/null 2>&1; then
+          echo "[OK] Docker Desktop is up."
+          _diag
+          return 0
+        fi
+      done
+    fi
+  fi
+
+  echo "[-] Docker daemon still not reachable. Start Colima (colima start) or Docker Desktop, then retry."
+  _diag
+  return 1
+}
+
+# Venv helpers (bash/zsh)
+function ensure_venv() {
+  # 0) Preflight
+  if ! command -v uv >/dev/null 2>&1; then
+    echo "[-] 'uv' is not installed. On macOS: brew install uv" >&2
+    exit 1
+  fi
+
+  # 1) Decide whether to recreate
+  local RECREATE=0
+  if [[ "${RECREATE_VENV:-0}" == "1" || "${1:-}" == "--recreate-venv" ]]; then
+    RECREATE=1
+  fi
+
+  # 2) If venv exists but Python version is wrong, recreate
+  if [[ -d .venv && $RECREATE -eq 0 ]]; then
+    if [[ -x .venv/bin/python ]]; then
+      local VER
+      VER="$(.venv/bin/python -c 'import sys; print(\".\".join(map(str, sys.version_info[:2])))' 2>/dev/null || echo '')"
+      if [[ "$VER" != "3.11" ]]; then
+        echo "[*] Existing .venv uses Python $VER; recreating for 3.11…"
+        RECREATE=1
+      fi
+    else
+      RECREATE=1
+    fi
+  fi
+
+  # 3) Create/recreate
+  if [[ $RECREATE -eq 1 ]]; then
+    echo "[*] Recreating virtualenv (.venv)…"
+    UV_VENV_CLEAR=1 uv venv --python 3.11 .venv
+  else
+    if [[ -d .venv ]]; then
+      echo "[*] Using existing .venv (set RECREATE_VENV=1 or pass --recreate-venv to rebuild)"
+    else
+      echo "[*] Creating .venv…"
+      uv venv --python 3.11 .venv
+    fi
+  fi
+
+  # 4) Activate (works for bash/zsh)
+  # shellcheck disable=SC1091
+  if ! source .venv/bin/activate 2>/dev/null; then
+    echo "[-] Failed to activate .venv" >&2
+    exit 1
+  fi
+
+  # 5) Ensure pip and project deps are ready (silent pip upgrade, then uv sync if pyproject exists)
+  if [[ -f backend/pyproject.toml ]]; then
+    echo "[*] Syncing Python deps (backend)…"
+    (cd backend && uv sync)
+  elif [[ -f pyproject.toml ]]; then
+    echo "[*] Syncing Python deps…"
+    uv sync
+  fi
+}
+
+function deps() {
+  echo "[*] Checking base tooling…"
+  command -v uv >/dev/null 2>&1 || { echo "Missing 'uv'. Install with: brew install uv"; exit 1; }
+  command -v docker >/dev/null 2>&1 || { echo "Missing Docker. Install Docker Desktop or use Colima."; exit 1; }
+
+  # NEW: ensure Docker daemon is actually running
+  ensure_docker || exit 1
+
+  ensure_venv "${SHIFTED:-}"
+}
+
+function infra() {
+  local COMPOSE="$(_compose)"
+  echo "[*] Starting docker infra (Postgres/Redis/MinIO)…"
+
+  # NEW: ensure Docker is up (Colima or Desktop)
+  ensure_docker || exit 1
+
+  (cd infra && ${COMPOSE} up -d)
+  (cd infra && ${COMPOSE} ps)
+}
+
+function llama() {
+  if [[ ! -f "$MODEL_PATH" ]]; then
+    echo "[-] MODEL_PATH not found: $MODEL_PATH"
+    echo "    Set MODEL_PATH=/path/to/your.gguf before running 'dev up'."
+    exit 1
+  fi
+  if ! command -v llama-server >/dev/null 2>&1; then
+    echo "[-] 'llama-server' not found. Install with: brew install llama.cpp"
+    exit 1
+  fi
+  echo "[*] Launching llama.cpp server on :$LLAMA_PORT"
+  pkill -f "llama-server.*:${LLAMA_PORT}" >/dev/null 2>&1 || true
+
+  # Start with embeddings enabled and mean pooling for OAI-compat
+  (llama-server -m "$MODEL_PATH" -c 8192 --port "$LLAMA_PORT" --host 127.0.0.1 \
+    --embedding --pooling mean \
+    --parallel 4 --batch-size 512 --n-gpu-layers 35) &
+  sleep 2
+  echo "[*] llama.cpp endpoint: http://127.0.0.1:${LLAMA_PORT}/v1"
+}
+
+function backend() {
+  echo "[*] Starting API :$API_PORT"
+  ensure_venv
+  pushd backend >/dev/null
+  uv sync
+  export PYTHONPATH=.
+  (uv run uvicorn app.main:app --reload --port "$API_PORT") &
+  popd >/dev/null
+  echo "[*] API: http://localhost:${API_PORT}"
+}
+
+function up() {
+  deps
+  infra
+  llama
+  backend
+  echo
+  echo "[OK] Stack up."
+  echo "    Backend: http://localhost:${API_PORT}"
+  echo "    llama.cpp: http://127.0.0.1:${LLAMA_PORT}/v1"
+}
+
+function down() {
+  echo "[*] Stopping services…"
+  pkill -f "uvicorn app.main:app" >/dev/null 2>&1 || true
+  pkill -f "llama-server.*:${LLAMA_PORT}" >/dev/null 2>&1 || true
+  local COMPOSE="$(_compose)"
+  (cd infra && ${COMPOSE} down) || true
+  echo "[OK] Down."
+}
+
+case "$CMD" in
+  up) up ;;
+  down) down ;;
+  deps) deps ;;
+  infra) infra ;;
+  llama) llama ;;
+  backend) backend ;;
+  diag) _diag ;;
+  *) echo "Usage: ./dev {up|down|deps|infra|llama|backend|diag} [--recreate-venv]"; exit 1 ;;
+esac

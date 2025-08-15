@@ -1,0 +1,13 @@
+/.env.example
+/.venv
+/Rodney-Chatman-Resume.docx
+/agent-mega-stack.zip
+/agentStack.zip
+/agent_api.txt
+/apply.sh
+/curl-tests-for-agents.txt
+/curl-tests-for-files.txt
+/curl-tests-for-tools.txt
+/howTo
+/postman
+/test_rag_doc.txt
