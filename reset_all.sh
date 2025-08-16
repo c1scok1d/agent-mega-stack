@@ -153,6 +153,10 @@ CREATE TABLE IF NOT EXISTS users (
   email CITEXT NOT NULL UNIQUE,
   password_hash TEXT NOT NULL,
   name TEXT NOT NULL DEFAULT '',
+  profession TEXT NOT NULL DEFAULT '',
+  birthday TEXT NOT NULL DEFAULT '',
+  business_name TEXT NOT NULL DEFAULT '',
+  business_address TEXT NOT NULL DEFAULT '',
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
