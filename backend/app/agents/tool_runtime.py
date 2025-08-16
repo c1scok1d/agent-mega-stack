@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import json
 from typing import Any, Dict, List, Optional
+from psycopg.rows import dict_row
+
 
 from app.agents.http_tool import HttpTool  # you already have this
 from app.rag.index import rag_search
+from app.core.db import get_conn
 
 
 class ToolProto:
@@ -53,6 +56,21 @@ def build_tools_for_user(
     - tool_rows: rows from DB (each row must include 'kind', 'name', 'config')
     """
     tools: Dict[str, ToolProto] = {}
+
+    # 0) Load DB rows on demand if not provided
+    if tool_rows is None:
+        with get_conn(cursor_factory=dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT name, kind, config
+                    FROM tools
+                    WHERE user_id = %s
+                    ORDER BY name
+                    """,
+                    (user_id,),
+                )
+                tool_rows = cur.fetchall()
 
     # 1) built-ins
     if include_defaults:

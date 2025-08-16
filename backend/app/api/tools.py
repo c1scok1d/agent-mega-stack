@@ -14,6 +14,8 @@ class ToolIn(BaseModel):
     name: str = Field(..., min_length=1)
     kind: Literal["rag.search", "http"]  # extend later
     config: dict = Field(default_factory=dict)
+    tool: str
+    args: Dict[str, Any] = {}
 
 @router.post("/v1/tools")
 def create_tool(body: ToolIn, user: Authed = Depends(get_current_user)):
@@ -50,11 +52,34 @@ def run_tool(payload: ToolRunIn, user: Authed = Depends(get_current_user)):
     Execute a tool directly by name. Looks up the user's installed tools and runs the match.
     """
     # Build runtime map of tools for this user (includes HTTP tools, rag.search, etc.)
-    tools = build_tools_for_user(user.user_id, include_defaults=True)
+    #tools = build_tools_for_user(user_id=user.user_id, include_defaults=True)
+    # Load this user's tool rows once (if none installed, this returns empty list)
+    with get_conn(cursor_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT name, kind, config
+                FROM tools
+                WHERE user_id = %s
+                ORDER BY name
+                """,
+                (user.user_id,),
+            )
+            tool_rows = cur.fetchall()
+
+    # Build runtime map (adds built-ins if include_defaults=True)
+    tools = build_tools_for_user(
+        user_id=user.user_id,
+        include_defaults=True,
+        tool_rows=tool_rows)
 
     impl = tools.get(payload.tool)
     if impl is None:
-        raise HTTPException(404, detail=f"Tool '{payload.tool}' not found for this user")
+        #raise HTTPException(404, detail=f"Tool '{payload.tool}' not found for this user")
+        available = sorted(tools.keys())
+        hint = f" Available: {', '.join(available)}" if available else " No tools installed."
+        raise HTTPException(404, detail=f"Tool '{payload.tool}' not found for this user.{hint}")
+ 
 
     try:
         # Support either a `.run(**kwargs)` style or a simple callable(dict) style
