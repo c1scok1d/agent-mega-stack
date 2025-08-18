@@ -11,3 +11,9 @@
 /howTo
 /postman
 /test_rag_doc.txt
+.DS_Store
+backend/app/api/*.pyc
+backend/storage
+backend/.rag/*
+backend/.rag_store/*
+backend/app/__pycache__/main.cpython-311.pyc
