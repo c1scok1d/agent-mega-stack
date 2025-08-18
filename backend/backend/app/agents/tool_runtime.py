@@ -21,9 +21,14 @@ class RagSearchTool(ToolProto):
     def __init__(self, user_id: str):
         self.user_id = user_id
 
-    def run(self, query: str, k: int = 4, **_: Any):
-        # returns [{text, metadata}, ...]
-        return rag_search(self.user_id, query=query, k=k)
+    def run(self, query: str, k: int = 6, source: str | None = None, min_score: float = 0.0):
+        hits = self._search_impl(query, k=k*2)  # overfetch a bit
+        if source:
+            s = source.lower()
+            hits = [h for h in hits if s in (h.get("metadata", {}).get("source","").lower())]
+        if min_score:
+            hits = [h for h in hits if (h.get("score") or 0.0) >= min_score]
+        return hits[:k]
 
 
 def _ensure_dict(cfg: Any) -> dict:

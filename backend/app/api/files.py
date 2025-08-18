@@ -1,12 +1,16 @@
 # app/api/files.py
-from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, Path
-from pydantic import BaseModel, Field
-from typing import List
+from __future__ import annotations
 
-from app.core.security import Authed, get_current_user
+import os
+import shutil
+from tempfile import NamedTemporaryFile
+
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, Path
+
+from app.api.auth import Authed, get_current_user
+from app.core.ingest import extract_text_from_any, normalize_text, smart_chunk, is_file_in_rag
 from app.rag.index import (
-    upsert_text,
-    similarity_search_with_scores,
+    upsert_chunks_for_source,
     list_sources,
     delete_source,
 )
@@ -14,45 +18,59 @@ from app.rag.index import (
 router = APIRouter()
 
 
-class SearchIn(BaseModel):
-    query: str = Field(..., min_length=1)
-    k: int = Field(4, ge=1, le=20)
-
-
 @router.post("/v1/files")
-async def upload_file(
-    file: UploadFile = File(...),
-    user: Authed = Depends(get_current_user),
-):
+def upload_file(file: UploadFile = File(...), user: Authed = Depends(get_current_user)):
+    """
+    Upload a file, extract text, chunk, and upsert into the user's RAG index.
+    Accepts PDF / DOCX / TXT.
+    """
     try:
-        raw = await file.read()
-        # try strict utf-8 first; fallback to ignoring errors for odd encodings
-        try:
-            text = raw.decode("utf-8", errors="strict")
-        except UnicodeDecodeError:
-            text = raw.decode("utf-8", errors="ignore")
-
-        if not text.strip():
-            raise HTTPException(status_code=400, detail="Empty file")
-
-        chunks_added = upsert_text(user.user_id, text, source=file.filename or "upload")
-        return {
-            "ok": True,
-            "filename": file.filename,
-            "size_bytes": len(raw),
-            "chunks_indexed": chunks_added,
-            "embedding_backend": "fastembed",  # or whatever you set in index.py
-        }
-    except HTTPException:
-        raise
+        with NamedTemporaryFile(delete=False) as tmp:
+            shutil.copyfileobj(file.file, tmp)
+            tmp_path = tmp.name
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Upload failed: {e!s}")
+        raise HTTPException(status_code=400, detail=f"Failed to read upload: {e!s}")
+
+    source = file.filename or "uploaded"
+
+    try:
+        extracted = extract_text_from_any(tmp_path, source)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Extraction failed: {e!s}")
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+    text = normalize_text(extracted.get("text", "") or "")
+    if not text:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not extract meaningful text from {source}. Try uploading as PDF or TXT.",
+        )
+
+    chunks = smart_chunk(text, target_tokens=300, overlap_tokens=40)
+    if not chunks:
+        raise HTTPException(status_code=400, detail="Text chunking produced no content")
+
+    try:
+        n = upsert_chunks_for_source(
+            user_id=user.user_id,
+            source=source,
+            chunks=chunks,
+            metadata=extracted.get("meta") or {},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Index upsert failed: {e!s}")
+
+    return {"ok": True, "source": source, "chunks_added": n, "meta": extracted.get("meta") or {}}
 
 
 @router.get("/v1/files")
 def list_files(user: Authed = Depends(get_current_user)):
     """
-    List distinct sources (filenames) and how many chunks each has.
+    List distinct sources (filenames) with chunk counts and file_id.
     """
     try:
         items = list_sources(user.user_id)
@@ -73,30 +91,7 @@ def delete_file(
     try:
         removed = delete_source(user.user_id, source)
         if removed == 0:
-            # Not an error; just nothing to remove
             return {"ok": True, "removed": 0, "message": "No chunks matched this source."}
         return {"ok": True, "removed": removed}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Delete failed: {e!s}")
-
-
-@router.post("/v1/files/search")
-def search_files(body: SearchIn, user: Authed = Depends(get_current_user)):
-    """
-    Semantic search over the user's indexed chunks.
-    """
-    try:
-        results = similarity_search_with_scores(user.user_id, body.query, k=body.k)
-        # Normalize shape for the API
-        out = []
-        for d, score in results:
-            out.append(
-                {
-                    "text": d.page_content,
-                    "source": (d.metadata or {}).get("source"),
-                    "score": float(score),
-                }
-            )
-        return {"query": body.query, "results": out}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Search failed: {e!s}") 
